@@ -68,7 +68,7 @@ class StateManager:
     def _load_products(self):
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id,name,price,stock,emoji,category,enabled FROM products ORDER BY id"
+                "SELECT id,name,price,stock,emoji,category,enabled FROM products ORDER BY name"
             ).fetchall()
         self.state.products = {
             r[0]: Product(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]))
@@ -396,24 +396,94 @@ class StateManager:
                 return False, "Supabase credentials not configured."
 
             sb = create_client(url, key)
-            resp = sb.table("products").select("*").execute()
+            resp = sb.table("snack_catalog").select("*").execute()
             products = resp.data
+
+            skipped = 0
+            synced = 0
+            skip_reasons = []
+
+            # Debug: log the raw keys from the first row so mismatches are visible
+            if products:
+                import logging
+                logging.warning(f"[Supabase] First row keys: {list(products[0].keys())}")
+                logging.warning(f"[Supabase] First row data: {products[0]}")
 
             with self._conn() as conn:
                 for p in products:
-                    conn.execute(
-                        """INSERT INTO products (id,name,price,emoji,category)
-                           VALUES (?,?,?,?,?)
-                           ON CONFLICT(id) DO UPDATE SET
-                             name=excluded.name,
-                             price=excluded.price,
-                             emoji=excluded.emoji,
-                             category=excluded.category""",
-                        (p["id"], p["name"], p["price"],
-                         p.get("emoji", "📦"), p.get("category", "misc")),
-                    )
+                    try:
+                        # id is a UUID string – store as text, use a hash for
+                        # the integer primary key expected by the local schema
+                        uuid_str = str(p["id"])
+                        # Deterministic integer from UUID (lower 8 hex digits)
+                        prod_id  = int(uuid_str.replace("-", "")[-8:], 16) & 0x7FFFFFFF
+                        name     = str(p.get("name") or "Unknown")
+
+                        # recommended_price is stored in CENTS (e.g. 150 = €1.50)
+                        raw_price = p.get("recommended_price")
+                        if raw_price is None:
+                            price = 0.00
+                        else:
+                            if isinstance(raw_price, str):
+                                raw_price = raw_price.strip().replace(",", ".")
+                            price = round(float(raw_price) / 100, 2)  # cents -> euros
+
+                        image_url = str(p.get("image_url") or "📦")
+                        quantity  = int(p.get("quantity") or 0)
+
+                    except (KeyError, TypeError, ValueError) as e:
+                        skip_reasons.append(f"row id={p.get('id','?')}: {e}")
+                        skipped += 1
+                        continue
+
+                    # Check if product already exists locally
+                    existing = conn.execute(
+                        "SELECT stock FROM products WHERE id=?", (prod_id,)
+                    ).fetchone()
+
+                    if existing:
+                        # Update catalog fields only – never touch local stock
+                        conn.execute(
+                            """UPDATE products
+                               SET name=?, price=?, emoji=?
+                               WHERE id=?""",
+                            (name, raw_price, image_url, prod_id),
+                        )
+                    else:
+                        # New product – use Supabase quantity as opening stock
+                        conn.execute(
+                            """INSERT INTO products
+                               (id, name, price, stock, emoji, category)
+                               VALUES (?,?,?,?,?,?)""",
+                            (prod_id, name, raw_price, quantity, image_url, "misc"),
+                        )
+                    synced += 1
+
+            # Remove original seeded placeholder products (id 1-9)
+            # now that we have real products from Supabase
+            if synced > 0:
+                synced_ids = set()
+                with self._conn() as conn:
+                    rows = conn.execute("SELECT id FROM products").fetchall()
+                    for (rid,) in rows:
+                        synced_ids.add(rid)
+                # IDs 1-9 are the local seeds; any hashed UUID-derived ID is >> 9
+                seed_ids = [i for i in synced_ids if 1 <= i <= 9]
+                if seed_ids and any(i > 9 for i in synced_ids):
+                    with self._conn() as conn:
+                        conn.execute(
+                            f"DELETE FROM products WHERE id IN ({','.join('?'*len(seed_ids))})",
+                            seed_ids,
+                        )
+
             self._load_products()
-            return True, f"Synced {len(products)} products from Supabase."
+            msg = f"Synced {synced} products from Supabase."
+            if skipped:
+                reasons = "; ".join(skip_reasons[:3])
+                if len(skip_reasons) > 3:
+                    reasons += f" ...+{len(skip_reasons)-3} more"
+                msg += f"\n\n{skipped} rows skipped. Reasons:\n{reasons}"
+            return True, msg
         except ImportError:
             return False, "supabase-py not installed. Run: pip install supabase"
         except Exception as e:

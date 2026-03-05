@@ -7,11 +7,13 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QFrame, QSizePolicy, QMessageBox,
     QScrollArea, QStackedWidget,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QThread, QObject
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap
 
 import sys
 import os
+import urllib.request
+import threading
 
 # Ensure parent directory is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -22,27 +24,129 @@ from ui.admin_panel import AdminPanel
 from ui.styles import MAIN_STYLE, PRODUCT_BTN_STYLE, SCREEN_STYLE
 
 
+# Module-level image cache: url -> QPixmap (avoids re-downloading on refresh)
+_image_cache: dict[str, QPixmap] = {}
+
+
 class ProductButton(QPushButton):
-    """A single product cell in the 3×3 grid."""
+    """A single product cell in the 3x3 grid.
+    Renders a QPixmap thumbnail when product.emoji is an image URL,
+    downloading it in a background thread so the UI never blocks.
+    """
 
     def __init__(self, product: Product, parent=None):
         super().__init__(parent)
         self.product = product
-        self._refresh(product)
         self.setFixedSize(QSize(140, 140))
         self.setStyleSheet(PRODUCT_BTN_STYLE)
+        # Each button has its own icon label + text label stacked inside
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(6, 6, 6, 6)
+        self._layout.setSpacing(2)
+        self._layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._icon_label = QLabel()
+        self._icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._icon_label.setFixedSize(QSize(64, 64))
+        self._icon_label.setStyleSheet("background: transparent; border: none;")
+        self._layout.addWidget(self._icon_label)
+
+        self._name_label = QLabel()
+        self._name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._name_label.setWordWrap(True)
+        self._name_label.setStyleSheet(
+            "background: transparent; border: none; "
+            "font-size: 11px; font-weight: bold; color: #e6edf3;"
+        )
+        self._layout.addWidget(self._name_label)
+
+        self._price_label = QLabel()
+        self._price_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._price_label.setStyleSheet(
+            "background: transparent; border: none; font-size: 11px;"
+        )
+        self._layout.addWidget(self._price_label)
+
+        self._refresh(product)
 
     def _refresh(self, product: Product):
         self.product = product
         sold_out = product.stock == 0
-        icon = product.emoji if not sold_out else "❌"
-        self.setText(
-            f"<div style='font-size:36px'>{icon}</div>"
-            f"<div style='font-size:12px; font-weight:bold'>{product.name}</div>"
-            f"<div style='font-size:11px; color:{'#e74c3c' if sold_out else '#27ae60'}'>"
-            f"{'SOLD OUT' if sold_out else product.price_display}</div>"
-        )
         self.setEnabled(not sold_out)
+
+        self._name_label.setText(product.name)
+
+        price_color = "#e74c3c" if sold_out else "#27ae60"
+        price_text  = "SOLD OUT" if sold_out else product.price_display
+        self._price_label.setText(price_text)
+        self._price_label.setStyleSheet(
+            f"background: transparent; border: none; "
+            f"font-size: 11px; color: {price_color};"
+        )
+
+        url = product.emoji  # may be a URL or an emoji character
+        if url.startswith("http"):
+            if url in _image_cache:
+                self._set_pixmap(_image_cache[url], sold_out)
+            else:
+                # Show spinner while loading
+                self._icon_label.setText("⏳")
+                self._icon_label.setStyleSheet(
+                    "background: transparent; border: none; font-size: 28px;"
+                )
+                threading.Thread(
+                    target=self._fetch_image, args=(url, sold_out), daemon=True
+                ).start()
+        else:
+            # Plain emoji – render as large text
+            self._icon_label.setPixmap(QPixmap())  # clear any old pixmap
+            self._icon_label.setText("❌" if sold_out else url)
+            self._icon_label.setStyleSheet(
+                "background: transparent; border: none; font-size: 36px;"
+            )
+
+    def _fetch_image(self, url: str, sold_out: bool):
+        """Download image in background thread, then update UI via QTimer."""
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "VendingMachine/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = resp.read()
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            if not pixmap.isNull():
+                _image_cache[url] = pixmap
+                # Schedule UI update on the main thread
+                QTimer.singleShot(0, lambda: self._set_pixmap(pixmap, sold_out))
+            else:
+                QTimer.singleShot(0, lambda: self._set_fallback())
+        except Exception:
+            QTimer.singleShot(0, lambda: self._set_fallback())
+
+    def _set_pixmap(self, pixmap: QPixmap, sold_out: bool):
+        scaled = pixmap.scaled(
+            64, 64,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if sold_out:
+            # Grey out the image for sold-out products
+            from PyQt6.QtGui import QPainter, QColor
+            greyed = QPixmap(scaled.size())
+            greyed.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(greyed)
+            painter.setOpacity(0.35)
+            painter.drawPixmap(0, 0, scaled)
+            painter.end()
+            scaled = greyed
+        self._icon_label.setPixmap(scaled)
+        self._icon_label.setText("")
+        self._icon_label.setStyleSheet("background: transparent; border: none;")
+
+    def _set_fallback(self):
+        self._icon_label.setText("🛍")
+        self._icon_label.setStyleSheet(
+            "background: transparent; border: none; font-size: 32px;"
+        )
 
     def update_product(self, product: Product):
         self._refresh(product)
@@ -110,11 +214,26 @@ class DisplayScreen(QFrame):
     def set_inserted(self, cents: int):
         self.inserted_label.setText(f"€{cents/100:.2f}")
 
-    def set_selected(self, product: Product | None):
+    def set_selected(self, product: "Product | None"):
         if product:
-            self.selected_label.setText(f"{product.emoji} {product.name}")
+            url = product.emoji
+            if url.startswith("http"):
+                if url in _image_cache:
+                    pm = _image_cache[url].scaled(
+                        28, 28,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    self.selected_label.setPixmap(pm)
+                    self.selected_label.setText("")
+                else:
+                    self.selected_label.setText(f"🛍 {product.name}")
+            else:
+                self.selected_label.setPixmap(QPixmap())
+                self.selected_label.setText(f"{url} {product.name}")
             self.price_label.setText(f"Price: {product.price_display}")
         else:
+            self.selected_label.setPixmap(QPixmap())
             self.selected_label.setText("")
             self.price_label.setText("")
 
@@ -171,20 +290,17 @@ class MainWindow(QMainWindow):
         """)
         machine_layout.addWidget(brand)
 
-        # Product grid
-        grid_widget = QWidget()
-        self.product_grid = QGridLayout(grid_widget)
+        # Product grid – stored so it can be fully rebuilt after a sync
+        self.grid_widget = QWidget()
+        self.product_grid = QGridLayout(self.grid_widget)
         self.product_grid.setSpacing(8)
 
         self.product_buttons: dict[int, ProductButton] = {}
-        products = list(self.sm.state.products.values())
-        for i, product in enumerate(products[:9]):
-            btn = ProductButton(product)
-            btn.clicked.connect(lambda checked, pid=product.id: self._on_product_clicked(pid))
-            self.product_grid.addWidget(btn, i // 3, i % 3)
-            self.product_buttons[product.id] = btn
+        self._machine_layout = machine_layout   # keep ref for rebuild
+        self._grid_widget = self.grid_widget
+        self._populate_product_grid()
 
-        machine_layout.addWidget(grid_widget)
+        machine_layout.addWidget(self.grid_widget)
         root.addWidget(machine_frame, stretch=3)
 
         # ── Right: control panel ─────────────────────────────────────
@@ -366,11 +482,39 @@ class MainWindow(QMainWindow):
 
     def _refresh_all(self):
         self.sm._load_all()
-        self._refresh_products()
+        # Always do a full grid rebuild so synced products appear immediately
+        self._populate_product_grid()
         self._refresh_screen()
         self._refresh_wallet()
 
+    def _populate_product_grid(self):
+        """Clear and fully rebuild the 3x3 product grid."""
+        # Remove all existing widgets from the grid
+        while self.product_grid.count():
+            item = self.product_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.product_buttons.clear()
+
+        # Show up to 9 products; skip any beyond the first 9
+        products = list(self.sm.state.products.values())[:9]
+        # If fewer than 9, fill empty slots with placeholder labels
+        for i, product in enumerate(products):
+            btn = ProductButton(product)
+            btn.clicked.connect(
+                lambda checked, pid=product.id: self._on_product_clicked(pid)
+            )
+            self.product_grid.addWidget(btn, i // 3, i % 3)
+            self.product_buttons[product.id] = btn
+
     def _refresh_products(self):
+        # If the set of product IDs changed (e.g. after sync), do a full rebuild
+        current_ids = set(self.product_buttons.keys())
+        loaded_ids  = set(self.sm.state.products.keys())
+        if current_ids != loaded_ids:
+            self._populate_product_grid()
+            return
+        # Otherwise just update labels/prices in place
         for pid, btn in self.product_buttons.items():
             product = self.sm.state.products.get(pid)
             if product:

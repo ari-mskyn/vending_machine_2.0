@@ -531,12 +531,12 @@ class AdminPanel(QDialog):
         schema_box = QGroupBox("Expected Supabase Table Schema (products)")
         schema_layout = QVBoxLayout(schema_box)
         schema_txt = QLabel(
-            "CREATE TABLE products (\n"
+            "CREATE TABLE snack_catalog (\n"
             "  id       SERIAL PRIMARY KEY,\n"
             "  name     TEXT NOT NULL,\n"
-            "  price    NUMERIC(6,2) NOT NULL,\n"
-            "  emoji    TEXT DEFAULT '📦',\n"
-            "  category TEXT DEFAULT 'misc'\n"
+            "  recommended_price    NUMERIC(6,2) NOT NULL,\n"
+            "  image_url    TEXT DEFAULT '📦',\n"
+            "  quantity TEXT DEFAULT 'misc'\n"
             ");"
         )
         schema_txt.setStyleSheet("font-family: monospace; font-size: 11px; color: #2ecc71;")
